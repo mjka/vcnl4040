@@ -20,10 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 """
-`adafruit_vcnl4040`
+`vcnl4040`
 ================================================================================
 
-A CircuitPython library for the VCNL4040 proximity and ambient light sensor.
+A micropython library for the VCNL4040 proximity and ambient light sensor.
 
 
 * Author(s): Kattni Rembor
@@ -35,24 +35,141 @@ Implementation Notes
 
 .. * `Adafruit VCNL4040 <https://www.adafruit.com/products>`_
 
-**Software and Dependencies:**
+CircuitPython driver ported to micropython.
 
-* Adafruit CircuitPython firmware for the supported boards:
-  https://github.com/adafruit/circuitpython/releases
+CircuitPython can be found here: https://github.com/adafruit/Adafruit_CircuitPython_VCNL4040.git
 
-
- * Adafruit's Bus Device library: https://github.com/adafruit/Adafruit_CircuitPython_BusDevice
- * Adafruit's Register library: https://github.com/adafruit/Adafruit_CircuitPython_Register
 """
 
 from micropython import const
-import adafruit_bus_device.i2c_device as i2cdevice
-from adafruit_register.i2c_struct import UnaryStruct, ROUnaryStruct
-from adafruit_register.i2c_bits import RWBits
-from adafruit_register.i2c_bit import RWBit
+import struct
 
-__version__ = "0.0.0-auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_VCNL4040.git"
+
+class UnaryStruct:
+    """
+    Arbitrary single value structure register that is readable and writeable.
+
+    Values map to the first value in the defined struct.  See struct
+    module documentation for struct format string and its possible value types.
+
+    :param int register_address: The register address to read the bit from
+    :param type struct_format: The struct format string for this register.
+    """
+    def __init__(self, register_address, struct_format):
+        self.format = struct_format
+        self.register = register_address
+
+    def __get__(self, obj, objtype=None):
+        buf = bytearray(struct.calcsize(self.format))
+        obj.i2c.readfrom_mem_into(obj.address, self.register, buf)
+        return struct.unpack_from(self.format, buf, 0)[0]
+
+    def __set__(self, obj, value):
+        buf = bytearray(struct.calcsize(self.format))
+        struct.pack_into(self.format, buf, 1, value)
+        obj.i2c.writeto_mem(obj.address, self.register, buf)
+
+
+class ROUnaryStruct(UnaryStruct):
+    """
+    Arbitrary single value structure register that is read-only.
+
+    Values map to the first value in the defined struct.  See struct
+    module documentation for struct format string and its possible value types.
+
+    :param int register_address: The register address to read the bit from
+    :param type struct_format: The struct format string for this register.
+    """
+    def __set__(self, obj, value):
+        raise AttributeError()
+
+
+class RWBit:
+    """
+    Single bit register that is readable and writeable.
+
+    Values are `bool`
+
+    :param int register_address: The register address to read the bit from
+    :param type bit: The bit index within the byte at ``register_address``
+    :param int register_width: The number of bytes in the register. Defaults to 1.
+    :param bool lsb_first: Is the first byte we read from I2C the LSB? Defaults to true
+
+    """
+    def __init__(self, register_address, bit, register_width=1, lsb_first=True):
+        self.bit_mask = 1 << (bit % 8)  # the bitmask *within* the byte!
+        self.buffer = bytearray(register_width)
+        self.register = register_address
+        if lsb_first:
+            self.byte = bit // 8  # the byte number within the buffer
+        else:
+            self.byte = register_width - (bit // 8) - 1  # the byte number within the buffer
+
+    def __get__(self, obj, objtype=None):
+        obj.i2c.readfrom_mem_into(obj.address, self.register, self.buffer)
+        return bool(self.buffer[self.byte] & self.bit_mask)
+
+    def __set__(self, obj, value):
+        obj.i2c.readfrom_mem_into(obj.address, self.register, self.buffer)
+        if value:
+            self.buffer[self.byte] |= self.bit_mask
+        else:
+            self.buffer[self.byte] &= ~self.bit_mask
+        obj.i2c.writeto_mem(obj.address, self.register, self.buffer)
+
+
+class RWBits:
+    """
+    Multibit register (less than a full byte) that is readable and writeable.
+    This must be within a byte register.
+
+    Values are `int` between 0 and 2 ** ``num_bits`` - 1.
+
+    :param int num_bits: The number of bits in the field.
+    :param int register_address: The register address to read the bit from
+    :param type lowest_bit: The lowest bits index within the byte at ``register_address``
+    :param int register_width: The number of bytes in the register. Defaults to 1.
+    :param bool lsb_first: Is the first byte we read from I2C the LSB? Defaults to true
+    """
+    def __init__(self, num_bits, register_address, lowest_bit, register_width=1, lsb_first=True):
+        self.bit_mask = ((1 << num_bits)-1) << lowest_bit
+        # print("bitmask: ",hex(self.bit_mask))
+        if self.bit_mask >= 1 << (register_width*8):
+            raise ValueError("Cannot have more bits than register size")
+        self.lowest_bit = lowest_bit
+        self.buffer = bytearray(register_width)
+        self.lsb_first = lsb_first
+        self.register = register_address
+
+    def __get__(self, obj, objtype=None):
+        obj.i2c.readfrom_mem_into(obj.address, self.register, self.buffer)
+        # read the number of bytes into a single variable
+        reg = 0
+        order = range(len(self.buffer), 0, -1)
+        if not self.lsb_first:
+            order = reversed(order)
+        for i in order:
+            reg = (reg << 8) | self.buffer[i-1]
+        return (reg & self.bit_mask) >> self.lowest_bit
+
+    def __set__(self, obj, value):
+        value <<= self.lowest_bit    # shift the value over to the right spot
+        obj.i2c.readfrom_mem_into(obj.address, self.register, self.buffer)
+        reg = 0
+        order = range(len(self.buffer), 0, -1)
+        if not self.lsb_first:
+            order = range(0, len(self.buffer))
+        for i in order:
+            reg = (reg << 8) | self.buffer[i]
+        # print("old reg: ", hex(reg))
+        reg &= ~self.bit_mask  # mask off the bits we're about to change
+        reg |= value           # then or in our new value
+        # print("new reg: ", hex(reg))
+        for i in reversed(order):
+            self.buffer[i] = reg & 0xFF
+            reg >>= 8
+        obj.i2c.writeto_mem(obj.address, self.register, self.buffer)
 
 
 class VCNL4040:  # pylint: disable=too-few-public-methods
@@ -301,7 +418,8 @@ class VCNL4040:  # pylint: disable=too-few-public-methods
     """White light channel shutdown. When ``True``, white light data is disabled."""
 
     def __init__(self, i2c, address=0x60):
-        self.i2c_device = i2cdevice.I2CDevice(i2c, address)
+        self.i2c = i2c
+        self.address = address
         if self._device_id != 0x186:
             raise RuntimeError("Failed to find VCNL4040 - check wiring!")
 
